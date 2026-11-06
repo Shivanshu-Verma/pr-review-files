@@ -1,5 +1,84 @@
 # Review: Template Visibility for every organisation (go-live)
 
+## ROUND 2: read this first
+
+Round 1 is done. You reviewed crm #5588 at `93a7bfcf01` and ai-bot #2672 at `05e9188b2`, and requested changes on
+both. The author has fixed what was accepted, pushed the fixes, and **replied under every one of your Bitbucket
+comments** with what changed, or the evidence for not changing it. This section takes precedence; sections 0–9 below
+are the round-1 brief and remain the reference for the product, the code and the method.
+
+**New heads to review:**
+- crm `shivanshuverma/dev1-18063-template-visibility-access` at **`9455752123`** (on top of `93a7bfcf01`).
+- ai-bot `shivanshuverma/dev1-18120-template-visibility-ai-bot-backend-counterpart` at **`387b40927`** (on top of
+  `05e9188b2`).
+
+### R2.1 What to do in this round
+1. **Fetch the comments on both PRs and read the author's reply under each of your comments.**
+2. **Verify each reply against the new heads:**
+   - **"Fixed" replies:** read the change and run the check it names. The e2e harness, specs and SQL are listed
+     in R2.2.
+   - **"Not changing" replies:** check the evidence (file:line, measurements).
+3. **Resolve every thread whose reply holds:** the fix works, or the evidence for not changing it is correct. If a
+   reply does not hold, reply **in that same thread** with your evidence and leave it open. Do not open a new
+   thread for an old finding.
+4. **Look for regressions the fixes could cause.** Re-run your round-1 regression matrix on the touched paths:
+   create (single, multi-WABA, queued over 10 WABAs), the visibility save, the permissions GET, the picker, the
+   Meta sync revive, and the ai-bot Templates list and `/info`.
+5. **Approve each PR once all its threads are resolved and no new BLOCKER or SHOULD-FIX remains.** If something new
+   is found, request changes with only the new findings, inline at the breaking site.
+
+### R2.2 Fixed (verify these)
+
+| Your finding | Commit | What changed | How it was verified |
+|---|---|---|---|
+| crm BLOCKER: a create can join an audience its creator can't see | `9455752123` | `resolveVisibilityForCreate` throws 400 before any BSP call or enqueue when the name + language is live and hidden from the creator **and** at least one chosen WABA holds no copy: "A template with this name and language already exists on another WABA, and you don't have access to it. Please use a different name." When every chosen WABA already holds a copy, rule 17 refuses per WABA as before, now worded "A template with this name already exists on this WABA, and you don't have access to it. Please use a different name." Owners, the anchor and the anchor's manager still join | Real resolver on a throwaway PG (e2e section 7); unit specs in `template-visibility/__test__/index.service.spec.ts` |
+| crm SHOULD-FIX: the save misses a copy that lands between read and write | `9455752123` | `TemplateDataService.updateTemplateAudience({ orgId, name, language, fields })`: one PostgresRawService UPDATE over every live copy in the org (`"integrationId" IN (SELECT id FROM "Integration" WHERE "orgId" = $6)`), with `RETURNING "integrationId"`. Cache keys = read ∪ returned. `dateUpdated` is untouched | e2e section 9 inserts a copy between the read and the write; it gets the saved audience and its cache key is cleared |
+| crm SHOULD-FIX: a queued create writes the enqueue-time audience | `9455752123` | `resolveVisibilityForCreate` takes `carried` (the queued fields) and uses it only while no copy is live; `execute` always calls the resolver (one Q19 per item) | e2e section 10; `create-template-visibility.use-case.spec.ts` |
+| crm MERGE C4/C5: a revived copy is live with its old audience | `9455752123` | Sync writes the audience **before** the revive, touching only `"dateDeleted" IS NOT NULL` rows; `getSoftDeletedTemplates` (Q31) removed; helpers take object params. The per-group UPDATE is kept (not `jsonb_to_recordset`) to keep the diff small | e2e section 11 injects a failure into the audience write: the sync throws and the copy stays soft-deleted; the next sync revives it with the live audience |
+| crm REUSE C8: picker reads the row and builds the scope twice | `9455752123` | `getAudienceWriteAccessForTemplate` returns `{ template, ...access }` and is used by the PATCH, the GET and the picker; the picker's 403 comes from that one read (`canViewTemplate`) | Specs for all three use cases |
+| ai-bot BLOCKER: switch-on list aggregates run for every group before `LIMIT` | `387b40927` | The page query keeps the switch-off shape. One second query computes the six audience columns for the page's (name, language) pairs only, with the same WHERE string (access clause, filter, cursor). The three "first copy" picks now use `ORDER BY "Template".id` (earliest copy, the rule crm's inheritance uses) | Output vs the old code over 246 calls and 2,906 rows: identical except mixed groups (the old pick was plan order). PG16 at 30k templates × 3: list SQL 2.0–2.7 s → 1.23–1.64 s; audience query 1–3 ms |
+| ai-bot NIT: no Postgres test for `getTemplateWabaIds` | `387b40927` | A real-PG case in `libs/templates/__test__/visibility-filter.pg.test.js` runs the real `resolveAudiences` → `getTemplateWabaIds` | The other org's WABA is not counted; the disconnected number's WABA is; access only on that number doesn't count |
+| GIN index unused | `387b40927` | `schema_migrations/20261106120000_drop_template_visible_to_user_ids_gin.js`: `DROP INDEX CONCURRENTLY`; `down` recreates the exact partial index | up/down/up on a throwaway PG |
+| Pre-existing 500 on a body without `filters.statuses` | `387b40927` | `getTemplatesSchema` defaults `filters.statuses` to `[]` and `filters` to `{}`; `filters: null` / `[]` and a non-array `statuses` stay 400 | `router/templates/v1/__test__/schema.test.js`; the real controller |
+
+The e2e harness that runs the real crm save, picker, resolver and sync against a throwaway Postgres is not in the
+repo. Reproduce the same scenarios with your own harness. Both on-prem `production-onprem` images (`APP_ENV=au`)
+were built and booted with 0 broken-image markers.
+
+### R2.3 Not changed: check the evidence, then resolve
+- **crm SHOULD-FIX, scope query per message on public sends.** Both batch paths fail every message past the fifth
+  (`MAX_MESSAGES_PER_REQUEST = 5`, `public-api-send-message.service.ts:139`, enforced at `:1613` and `:1946`), so
+  100- and 500-message batches can't occur. The queue consumer, where the volume is, sends one message per
+  `sendMessagesRaw` call (`public-api-send-whatsapp-template-message.service.ts:56`), so a per-call memo doesn't
+  reach it. The guard runs only for restricted templates, and there are none at release.
+- **ai-bot SHOULD-FIX, unbounded filter options.** Deferred to the filter's launch (DEV1-13028). No client sends
+  `teamAnchorIds` at release: the desktop filter is commented out, and mini has none. Options come only from
+  MY_TEAM rows.
+- **ai-bot NIT, the JS sort.** Kept. Measured with the route's comparator on Node 22: 3.5 ms at 3,192 options, and
+  0.05 ms at 50. `localeCompare` doesn't depend on the database collation.
+- **"Drop `TeamRole_orgId_userId_index` as a duplicate".** Production's TeamRole indexes are `TeamRole_pkey`,
+  `TeamRole_orgId_userId_index`, `TeamRole_visibility_dateDeleted`, `idx_team_role_user_id` and
+  `index_TeamRole_teamId`. There is no `idx__team_role__org_id_user_id`; the `database.sql` you used is out of date
+  on this point.
+
+### R2.4 Premise changes since round 1 (do not re-raise)
+- **The release keeps the per-org gate.** The code works for every org, but each org is still turned on by the
+  `template-visibility-enabled` OrgVariable. Turning it on for everyone, and removing the gate, is a later step.
+  Section 1's "every organisation" and the switch options (a)/(b)/(c) are **out of scope** for this round.
+- **The §6 production reset is out of scope for these PRs.** Sizing and batching it is a rollout task.
+- **Brief corrections accepted:** OrgVariable's PK is `(orgId, name)`, so the org-row vs integration-row case can't
+  happen. The `remoteId` index you found in `database.sql` is taken as likely, but it hasn't been confirmed against
+  production.
+- **Known and accepted:**
+  - a create whose Q19 runs before a save and whose insert commits after it can still write the old audience
+    (millisecond window; a lock is not added);
+  - the ai-bot list's page and audience reads are two statements, so a save that commits between them can show one
+    group as Channel for that one response.
+- **Not under review:** the desktop toast text ("Not added (no access on any of this template's channels): …") goes
+  out in a separate desktop PR. Raj's ai-bot #2543 is superseded by #2672.
+
+---
+
 You are reviewing the pull requests linked with this message. Together they complete **Template Visibility** in
 DoubleTick, a WhatsApp CRM. Until now the feature was a pilot, switched on for two organisations. It is now going
 live for **every organisation, existing and new**. This is a **full review of the feature**, not just of the diff.
